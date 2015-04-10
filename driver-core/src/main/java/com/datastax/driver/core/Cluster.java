@@ -1404,21 +1404,21 @@ public class Cluster implements Closeable {
             return executor.submit(new ExceptionCatchingRunnable() {
                 @Override
                 public void runMayThrow() throws InterruptedException, ExecutionException {
-                    onUp(host);
+                    onUp(host, null);
                 }
             });
         }
 
-        private void onUp(final Host host) throws InterruptedException, ExecutionException {
+        private void onUp(final Host host, Connection preExistentConnection) throws InterruptedException, ExecutionException {
             // Note that in generalize we can parallelize the pool creation on
             // each session, but we shouldn't use executor since we're already
             // running on it most probably (and so we could deadlock). Use the
             // blockingExecutor instead, that's why it's for.
-            onUp(host, blockingExecutor);
+            onUp(host, preExistentConnection, blockingExecutor);
         }
 
         // Use triggerOnUp unless you're sure you want to run this on the current thread.
-        private void onUp(final Host host, ListeningExecutorService poolCreationExecutor) throws InterruptedException, ExecutionException {
+        private void onUp(final Host host, Connection preExistentConnection, ListeningExecutorService poolCreationExecutor) throws InterruptedException, ExecutionException {
             logger.debug("Host {} is UP", host);
 
             if (isClosed())
@@ -1474,7 +1474,7 @@ public class Cluster implements Closeable {
 
                 List<ListenableFuture<Void>> futures = Lists.newArrayListWithCapacity(sessions.size());
                 for (SessionManager s : sessions)
-                    futures.add(s.forceRenewPool(host, poolCreationExecutor));
+                    futures.add(s.forceRenewPool(host, preExistentConnection, poolCreationExecutor));
 
                 // Only mark the node up once all session have re-added their pool (if the load-balancing
                 // policy says it should), so that Host.isUp() don't return true before we're reconnected
@@ -1501,6 +1501,8 @@ public class Cluster implements Closeable {
                     s.updateCreatedPools(blockingExecutor);
 
             } finally {
+                if (preExistentConnection != null && !preExistentConnection.hasPool())
+                    preExistentConnection.closeAsync();
                 host.notificationsLock.unlock();
             }
         }
@@ -1554,11 +1556,10 @@ public class Cluster implements Closeable {
                     public void runMayThrow() throws InterruptedException, ExecutionException {
                         boolean success;
                         try {
-                            // TODO: as for the ReconnectionHandler, we could avoid "wasting" this connection
-                            connectionFactory.open(host).closeAsync();
+                            Connection connection = connectionFactory.open(host);
                             // Note that we want to do the pool creation on this thread because we want that
                             // when onUp return, the host is ready for querying
-                            onUp(host, MoreExecutors.sameThreadExecutor());
+                            onUp(host, connection, MoreExecutors.sameThreadExecutor());
                             // If one of the connections in onUp failed, it signaled the error and triggerd onDown,
                             // but onDown aborted because this reconnection attempt was in progress (JAVA-577).
                             // Test the state now to check than onUp succeeded (we know it's up-to-date since onUp was
@@ -1640,7 +1641,6 @@ public class Cluster implements Closeable {
                 if (distance == HostDistance.IGNORED || !startReconnection)
                     return;
 
-                // Note: we basically waste the first successful reconnection, but it's probably not a big deal
                 logger.debug("{} is down, scheduling connection retries", host);
                 startPeriodicReconnectionAttempt(host, isHostAddition);
             } finally {
@@ -1656,19 +1656,15 @@ public class Cluster implements Closeable {
                 }
 
                 protected void onReconnection(Connection connection) {
-                    // We don't use that first connection so close it.
-                    // TODO: this is a bit wasteful, we should consider passing it to onAdd/onUp so
-                    // we use it for the first HostConnectionPool created
-                    connection.closeAsync();
                     // Make sure we have up-to-date infos on that host before adding it (so we typically
                     // catch that an upgraded node uses a new cassandra version).
                     if (controlConnection.refreshNodeInfo(host)) {
                         logger.debug("Successful reconnection to {}, setting host UP", host);
                         try {
                             if (isHostAddition)
-                                onAdd(host);
+                                onAdd(host, connection);
                             else
-                                onUp(host);
+                                onUp(host, connection);
                         } catch (InterruptedException e) {
                             Thread.currentThread().interrupt();
                         } catch (Exception e) {
@@ -1676,6 +1672,7 @@ public class Cluster implements Closeable {
                         }
                     } else {
                         logger.debug("Not enough info for {}, ignoring host", host);
+                        connection.closeAsync();
                     }
                 }
 
@@ -1712,16 +1709,12 @@ public class Cluster implements Closeable {
                 }
 
                 protected void onReconnection(Connection connection) {
-                    // We don't use that first connection so close it.
-                    // TODO: this is a bit wasteful, we should consider passing it to onAdd/onUp so
-                    // we use it for the first HostConnectionPool created
-                    connection.closeAsync();
                     // Make sure we have up-to-date infos on that host before adding it (so we typically
                     // catch that an upgraded node uses a new cassandra version).
                     if (controlConnection.refreshNodeInfo(host)) {
                         logger.debug("Successful reconnection to {}, setting host UP", host);
                         try {
-                            onUp(host);
+                            onUp(host, connection);
                         } catch (InterruptedException e) {
                             Thread.currentThread().interrupt();
                         } catch (Exception e) {
@@ -1729,6 +1722,7 @@ public class Cluster implements Closeable {
                         }
                     } else {
                         logger.debug("Not enough info for {}, ignoring host", host);
+                        connection.closeAsync();
                     }
                 }
 
@@ -1754,13 +1748,13 @@ public class Cluster implements Closeable {
             return executor.submit(new ExceptionCatchingRunnable() {
                 @Override
                 public void runMayThrow() throws InterruptedException, ExecutionException {
-                    onAdd(host);
+                    onAdd(host, null);
                 }
             });
         }
 
         // Use triggerOnAdd unless you're sure you want to run this on the current thread.
-        private void onAdd(final Host host) throws InterruptedException, ExecutionException {
+        private void onAdd(final Host host, Connection preExistentConnection) throws InterruptedException, ExecutionException {
             if (isClosed())
                 return;
 
@@ -1812,7 +1806,7 @@ public class Cluster implements Closeable {
 
                 List<ListenableFuture<Void>> futures = Lists.newArrayListWithCapacity(sessions.size());
                 for (SessionManager s : sessions)
-                    futures.add(s.maybeAddPool(host, blockingExecutor));
+                    futures.add(s.maybeAddPool(host, preExistentConnection, blockingExecutor));
 
                 // Only mark the node up once all session have added their pool (if the load-balancing
                 // policy says it should), so that Host.isUp() don't return true before we're reconnected
@@ -1839,6 +1833,8 @@ public class Cluster implements Closeable {
                     s.updateCreatedPools(blockingExecutor);
 
             } finally {
+                if (preExistentConnection != null && !preExistentConnection.hasPool())
+                    preExistentConnection.closeAsync();
                 host.notificationsLock.unlock();
             }
         }
@@ -2071,7 +2067,7 @@ public class Cluster implements Closeable {
                                         // Make sure we have up-to-date infos on that host before adding it (so we typically
                                         // catch that an upgraded node uses a new cassandra version).
                                         if (controlConnection.refreshNodeInfo(newHost)) {
-                                            onAdd(newHost);
+                                            onAdd(newHost, null);
                                         } else {
                                             logger.debug("Not enough info for {}, ignoring host", newHost);
                                         }
@@ -2113,7 +2109,7 @@ public class Cluster implements Closeable {
                                         // Make sure we have up-to-date infos on that host before adding it (so we typically
                                         // catch that an upgraded node uses a new cassandra version).
                                         if (controlConnection.refreshNodeInfo(h)) {
-                                            onAdd(h);
+                                            onAdd(h, null);
                                         } else {
                                             logger.debug("Not enough info for {}, ignoring host", h);
                                         }
@@ -2126,7 +2122,7 @@ public class Cluster implements Closeable {
                                         // Make sure we have up-to-date infos on that host before adding it (so we typically
                                         // catch that an upgraded node uses a new cassandra version).
                                         if (controlConnection.refreshNodeInfo(hostUp)) {
-                                            onUp(hostUp);
+                                            onUp(hostUp, null);
                                         } else {
                                             logger.debug("Not enough info for {}, ignoring host", hostUp);
                                         }

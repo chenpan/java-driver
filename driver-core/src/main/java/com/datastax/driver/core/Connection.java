@@ -92,7 +92,7 @@ class Connection {
     final ListenableFuture<Void> initFuture;
     private final AtomicReference<ConnectionCloseFuture> closeFuture = new AtomicReference<ConnectionCloseFuture>();
 
-    private volatile HostConnectionPool pool;
+    private final AtomicReference<HostConnectionPool> poolRef = new AtomicReference<HostConnectionPool>();
 
     /** The instant when the connection should be trashed after being idle for too long */
     private volatile long trashTime = Long.MAX_VALUE;
@@ -101,14 +101,17 @@ class Connection {
     final AtomicBoolean markForTrash = new AtomicBoolean();
 
     /**
-     * Create a new connection to a Cassandra node.
+     * Create a new connection to a Cassandra node and associate it with a pool.
      *
      * The connection is open and initialized by the constructor.
+     *
+     * Note that an existing connection can also be associated to a pool later with {@link #setPool(HostConnectionPool)}.
      */
-    protected Connection(String name, InetSocketAddress address, Factory factory) {
+    protected Connection(String name, InetSocketAddress address, Factory factory, HostConnectionPool pool) {
         this.address = address;
         this.factory = factory;
         this.name = name;
+        this.poolRef.set(pool);
 
         int protocolVersion = factory.protocolVersion == 1 ? 1 : 2;
         final SettableFuture<Void> channelReadyFuture = SettableFuture.create();
@@ -161,13 +164,10 @@ class Connection {
     }
 
     /**
-     * Create a new connection to a Cassandra node, and associate it to a connection pool.
-     *
-     * Note that an existing connection can also be associated to a pool with {@link #setPool(HostConnectionPool)}
+     * Create a new connection to a Cassandra node.
      */
-    Connection(String name, InetSocketAddress address, Factory factory, HostConnectionPool pool) {
-        this(name, address, factory);
-        this.pool = pool;
+    Connection(String name, InetSocketAddress address, Factory factory) {
+        this(name, address, factory, null);
     }
 
     private static String extractMessage(Throwable t) {
@@ -365,8 +365,9 @@ class Connection {
             // If the host was reconnecting, and this error happens right after we opened a connection pool, but
             // before we could mark the node UP, we don't want to go through the SUSPECTED state, because that can
             // lead to a race condition that leaves the node UP with a closed pool.
+            HostConnectionPool pool = this.poolRef.get();
             boolean belongsToReconnectingPool = host.state != Host.State.UP &&
-                (this.pool == null || !this.pool.isClosed());
+                (pool == null || !pool.isClosed());
 
             boolean markSuspected = initFuture.isDone() && !belongsToReconnectingPool;
 
@@ -385,6 +386,7 @@ class Connection {
     }
 
     protected void notifyOwnerWhenDefunct(boolean hostIsDown) {
+        HostConnectionPool pool = this.poolRef.get();
         if (pool == null)
             return;
 
@@ -542,13 +544,12 @@ class Connection {
     }
 
     boolean hasPool() {
-        return this.pool != null;
+        return this.poolRef.get() != null;
     }
 
-    void setPool(HostConnectionPool pool) {
-        if (hasPool())
-            throw new IllegalStateException("cannot move a connection from one pool to another");
-        this.pool = pool;
+    /** @return whether the connection was already associated with a pool */
+    boolean setPool(HostConnectionPool pool) {
+        return poolRef.compareAndSet(null, pool);
     }
 
     /**
@@ -556,10 +557,9 @@ class Connection {
      * The connection should generally not be reused after that.
      */
     void release() {
-        if (pool == null)
-            return;
-
-        pool.returnConnection(this);
+        HostConnectionPool pool = poolRef.get();
+        if (pool != null)
+            pool.returnConnection(this);
     }
 
     long getTrashTime() {
@@ -883,7 +883,7 @@ class Connection {
     }
 
     private static final ConcurrentMap<EventLoop, Flusher> flusherLookup = new MapMaker()
-            .concurrencyLevel(16)
+        .concurrencyLevel(16)
             .weakKeys()
             .makeMap();
 

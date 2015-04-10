@@ -77,7 +77,12 @@ class HostConnectionPool {
 
     final SettableFuture<Void> initFuture;
 
-    public HostConnectionPool(final Host host, HostDistance hostDistance, final SessionManager manager) {
+    /**
+     * @param preExistentConnection an existing connection (from a reconnection attempt) that we want to
+     *                              reuse as part of this pool. Might be null or already used by another
+     *                              pool.
+     */
+    public HostConnectionPool(final Host host, HostDistance hostDistance, final SessionManager manager, Connection preExistentConnection){
         assert hostDistance != HostDistance.IGNORED;
         this.host = host;
         this.hostDistance = hostDistance;
@@ -97,9 +102,15 @@ class HostConnectionPool {
         // Create initial core connections
         final List<ListenableFuture<Connection>> connectionFutures =
             Lists.newArrayListWithCapacity(options().getCoreConnectionsPerHost(hostDistance));
-        for (int i = 0; i < options().getCoreConnectionsPerHost(hostDistance); i++)
-            connectionFutures.add(manager.connectionFactory().openAsync(this));
-
+        for (int i = 0; i < options().getCoreConnectionsPerHost(hostDistance); i++) {
+            if (preExistentConnection != null && preExistentConnection.setPool(this)) {
+                SettableFuture<Connection> future = SettableFuture.create();
+                future.set(preExistentConnection);
+                connectionFutures.add(future);
+            }
+            else
+                connectionFutures.add(manager.connectionFactory().openAsync(this));
+        }
         ListenableFuture<List<Connection>> allConnectionsFuture = Futures.allAsList(connectionFutures);
 
         // We could expose allConnectionsFuture directly so this is a bit superfluous, but it avoids

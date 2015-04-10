@@ -36,6 +36,7 @@ CHANGELOG
 - [improvement] Log keyspace xxx does not exist at WARN level (JAVA-534)
 - [improvement] Allow Cluster subclasses to delegate to another instance
   (JAVA-619)
+- [improvement] Optimize connection use after reconnection (JAVA-505)
 
 Merged from 2.0.9_fixes branch:
 
